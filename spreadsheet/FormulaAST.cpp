@@ -22,42 +22,13 @@ enum ExprPrecedence {
     EP_END,
 };
 
-// a bit is set when the parentheses are needed
 enum PrecedenceRule {
-    PR_NONE = 0b00,                // never needed
-    PR_LEFT = 0b01,                // needed for a left child
-    PR_RIGHT = 0b10,               // needed for a right child
-    PR_BOTH = PR_LEFT | PR_RIGHT,  // needed for both children
+    PR_NONE = 0b00,
+    PR_LEFT = 0b01,
+    PR_RIGHT = 0b10,
+    PR_BOTH = PR_LEFT | PR_RIGHT,
 };
 
-// PRECEDENCE_RULES[parent][child] determines if parentheses need
-// to be inserted between a parent and a child of specific precedences;
-// for some nodes rules are different for left and right children:
-// (X c Y) p Z  vs  X p (Y c Z)
-//
-// The interesting cases are the ones where removing the parens would change the AST.
-// It may happen when our precedence rules for parentheses are different from
-// the grammatic precedence of operations.
-//
-// Case analysis:
-// A + (B + C) - always okay (nothing of lower grammatic precedence could have been written to the
-// right)
-//    (e.g. if we had A + (B + C) / D, it wouldn't parse in a way
-//    that woudld have given us A + (B + C) as a subexpression to deal with)
-// A + (B - C) - always okay (nothing of lower grammatic precedence could have been written to the
-// right) A - (B + C) - never okay A - (B - C) - never okay A * (B * C) - always okay (the parent
-// has the highest grammatic precedence) A * (B / C) - always okay (the parent has the highest
-// grammatic precedence) A / (B * C) - never okay A / (B / C) - never okay
-// -(A + B) - never okay
-// -(A - B) - never okay
-// -(A * B) - always okay (the resulting binary op has the highest grammatic precedence)
-// -(A / B) - always okay (the resulting binary op has the highest grammatic precedence)
-// +(A + B) - **sometimes okay** (e.g. parens in +(A + B) / C are **not** optional)
-//     (currently in the table we're always putting in the parentheses)
-// +(A - B) - **sometimes okay** (same)
-//     (currently in the table we're always putting in the parentheses)
-// +(A * B) - always okay (the resulting binary op has the highest grammatic precedence)
-// +(A / B) - always okay (the resulting binary op has the highest grammatic precedence)
 constexpr PrecedenceRule PRECEDENCE_RULES[EP_END][EP_END] = {
     /* EP_ADD */ {PR_NONE, PR_NONE, PR_NONE, PR_NONE, PR_NONE, PR_NONE},
     /* EP_SUB */ {PR_RIGHT, PR_RIGHT, PR_NONE, PR_NONE, PR_NONE, PR_NONE},
@@ -72,9 +43,8 @@ public:
     virtual ~Expr() = default;
     virtual void Print(std::ostream& out) const = 0;
     virtual void DoPrintFormula(std::ostream& out, ExprPrecedence precedence) const = 0;
-    virtual double Evaluate(/*добавьте сюда нужные аргументы*/ args) const = 0;
+    virtual double Evaluate(std::function<double(Position)> args) const = 0;
 
-    // higher is tighter
     virtual ExprPrecedence GetPrecedence() const = 0;
 
     void PrintFormula(std::ostream& out, ExprPrecedence parent_precedence,
@@ -136,14 +106,45 @@ public:
             case Divide:
                 return EP_DIV;
             default:
-                // have to do this because VC++ has a buggy warning
                 assert(false);
                 return static_cast<ExprPrecedence>(INT_MAX);
         }
     }
 
-    double Evaluate(/*добавьте нужные аргументы*/) const override {
-			// Скопируйте ваше решение из предыдущих уроков.
+    double Evaluate(std::function<double(Position)> args) const override {
+        double left = lhs_->Evaluate(args);
+        double right = rhs_->Evaluate(args);
+        
+        if (std::isinf(left) || std::isinf(right) || std::isnan(left) || std::isnan(right)) {
+            throw FormulaError(FormulaError::Category::Arithmetic);
+        }
+        
+        double result;
+        switch (type_) {
+            case Add:
+                result = left + right;
+                break;
+            case Subtract:
+                result = left - right;
+                break;
+            case Multiply:
+                result = left * right;
+                break;
+            case Divide:
+                if (right == 0.0) {
+                    throw FormulaError(FormulaError::Category::Arithmetic);
+                }
+                result = left / right;
+                break;
+            default:
+                throw FormulaError(FormulaError::Category::Arithmetic);
+        }
+        
+        if (std::isinf(result) || std::isnan(result)) {
+            throw FormulaError(FormulaError::Category::Arithmetic);
+        }
+        
+        return result;
     }
 
 private:
@@ -180,8 +181,15 @@ public:
         return EP_UNARY;
     }
 
-    double Evaluate(/*добавьте нужные аргументы*/ args) const override {
-        // Скопируйте ваше решение из предыдущих уроков.
+    double Evaluate(std::function<double(Position)> args) const override {
+        double val = operand_->Evaluate(args);
+        if (type_ == UnaryMinus) {
+            val = -val;
+        }
+        if (std::isinf(val) || std::isnan(val)) {
+            throw FormulaError(FormulaError::Category::Arithmetic);
+        }
+        return val;
     }
 
 private:
@@ -211,8 +219,8 @@ public:
         return EP_ATOM;
     }
 
-    double Evaluate(/*добавьте нужные аргументы*/ args) const override {
-        // реализуйте метод.
+    double Evaluate(std::function<double(Position)> args) const override {
+        return args(*cell_);
     }
 
 private:
@@ -237,7 +245,7 @@ public:
         return EP_ATOM;
     }
 
-    double Evaluate(/*добавьте нужные аргументы*/ args) const override {
+    double Evaluate(std::function<double(Position)> /* args */) const override {
         return value_;
     }
 
@@ -327,7 +335,7 @@ public:
     }
 
     void visitErrorNode(antlr4::tree::ErrorNode* node) override {
-        throw ParsingError("Error when parsing: " + node->getSymbol()->getText());
+        throw FormulaException("Error when parsing: " + node->getSymbol()->getText());
     }
 
 private:
@@ -337,16 +345,29 @@ private:
 
 class BailErrorListener : public antlr4::BaseErrorListener {
 public:
-    void syntaxError(antlr4::Recognizer* /* recognizer */, antlr4::Token* /* offendingSymbol */,
-                     size_t /* line */, size_t /* charPositionInLine */, const std::string& msg,
-                     std::exception_ptr /* e */
-                     ) override {
-        throw ParsingError("Error when lexing: " + msg);
+    void syntaxError(antlr4::Recognizer*, antlr4::Token*, size_t, size_t,
+        const std::string& msg, std::exception_ptr) override {
+        throw FormulaException("Error when lexing: " + msg);
     }
 };
 
 }  // namespace
 }  // namespace ASTImpl
+
+class FormulaErrorStrategy : public antlr4::BailErrorStrategy {
+public:
+    void recover(antlr4::Parser* recognizer, std::exception_ptr e) override {
+        throw FormulaException("Syntax error in formula");
+    }
+
+    antlr4::Token* recoverInline(antlr4::Parser* recognizer) override {
+        throw FormulaException("Syntax error in formula");
+    }
+
+    void sync(antlr4::Parser* recognizer) override {
+        // �� ������ ������, ����� ������� ������
+    }
+};
 
 FormulaAST ParseFormulaAST(std::istream& in) {
     using namespace antlr4;
@@ -361,15 +382,22 @@ FormulaAST ParseFormulaAST(std::istream& in) {
     CommonTokenStream tokens(&lexer);
 
     FormulaParser parser(&tokens);
-    auto error_handler = std::make_shared<BailErrorStrategy>();
+    auto error_handler = std::make_shared<FormulaErrorStrategy>();
     parser.setErrorHandler(error_handler);
     parser.removeErrorListeners();
 
-    tree::ParseTree* tree = parser.main();
-    ASTImpl::ParseASTListener listener;
-    tree::ParseTreeWalker::DEFAULT.walk(&listener, tree);
-
-    return FormulaAST(listener.MoveRoot(), listener.MoveCells());
+    try {
+        tree::ParseTree* tree = parser.main();
+        ASTImpl::ParseASTListener listener;
+        tree::ParseTreeWalker::DEFAULT.walk(&listener, tree);
+        return FormulaAST(listener.MoveRoot(), listener.MoveCells());
+    }
+    catch (const FormulaException&) {
+        throw;
+    }
+    catch (const std::exception& e) {
+        throw FormulaException(e.what());
+    }
 }
 
 FormulaAST ParseFormulaAST(const std::string& in_str) {
@@ -391,14 +419,14 @@ void FormulaAST::PrintFormula(std::ostream& out) const {
     root_expr_->PrintFormula(out, ASTImpl::EP_ATOM);
 }
 
-double FormulaAST::Execute(/*добавьте нужные аргументы*/ args) const {
-    return root_expr_->Evaluate(/*добавьте нужные аргументы*/ args);
+double FormulaAST::Execute(std::function<double(Position)> args) const {
+    return root_expr_->Evaluate(args);
 }
 
 FormulaAST::FormulaAST(std::unique_ptr<ASTImpl::Expr> root_expr, std::forward_list<Position> cells)
     : root_expr_(std::move(root_expr))
     , cells_(std::move(cells)) {
-    cells_.sort();  // to avoid sorting in GetReferencedCells
+    cells_.sort();
 }
 
 FormulaAST::~FormulaAST() = default;
